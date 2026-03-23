@@ -5,6 +5,7 @@ pub mod request;
 use std::{collections::HashMap, error::Error, sync::Mutex};
 
 use elevator::Elevator;
+use futures::future::join_all;
 
 use crate::controller::{elevator::ElevatorState, errors::RequestError, request::Request};
 
@@ -38,8 +39,18 @@ impl Controller {
     }
 
     // Lets explore streams here
-    pub async fn state(&self) -> HashMap<i8, ElevatorState> {
-        todo!()
+    pub async fn state(&self) -> HashMap<usize, ElevatorState> {
+        let results: Vec<_> = join_all(
+            self.elevators
+                .iter()
+                .map(|el| async move { (el.id, el.get_state().await) }),
+        )
+        .await;
+
+        results
+            .into_iter()
+            .filter_map(|(id, res)| res.ok().map(|state| (id, state)))
+            .collect()
     }
 
     async fn select_elevator(&self, _from: i16, _to: i16) -> &Elevator {
