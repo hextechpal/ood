@@ -1,14 +1,12 @@
 mod elevator;
+pub mod errors;
 pub mod request;
 
 use std::{collections::HashMap, error::Error, sync::Mutex};
 
 use elevator::Elevator;
 
-use crate::controller::{
-    elevator::{Direction, ElevatorState},
-    request::Request,
-};
+use crate::controller::{elevator::ElevatorState, errors::RequestError, request::Request};
 
 #[allow(dead_code)]
 enum Strategy {
@@ -24,7 +22,7 @@ pub struct Controller {
 
 #[allow(dead_code)]
 impl Controller {
-    pub fn new(capacity: i8) -> Controller {
+    pub fn new(capacity: usize) -> Controller {
         let elevators = (0..capacity).map(|id| Elevator::new(id)).collect();
         Controller {
             elevators,
@@ -33,16 +31,14 @@ impl Controller {
         }
     }
 
-    pub async fn request(&self, from: i16, to: i16) -> Result<bool, Box<dyn Error>> {
+    pub async fn request(&self, from: i16, to: i16) -> Result<bool, RequestError> {
         let el = self.select_elevator(from, to).await;
-        match el.add_request(Request::new(from, to)).await {
-            Ok(_) => Ok(true),
-            Err(_) => Err("some error".into()),
-        }
+        el.add_request(Request::new(from, to)).await?;
+        Ok(true)
     }
 
     // Lets explore streams here
-    pub async fn state(&self) -> HashMap<i8, Option<ElevatorState>> {
+    pub async fn state(&self) -> HashMap<i8, ElevatorState> {
         todo!()
     }
 

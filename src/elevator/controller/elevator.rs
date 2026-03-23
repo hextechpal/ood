@@ -1,14 +1,15 @@
-use std::error::Error;
-
 use tokio::{
     sync::{
-        mpsc::{self, Receiver, Sender, error::SendError},
+        mpsc::{self, Receiver, Sender},
         oneshot::{self, Sender as OneshotSender},
     },
     task::JoinHandle,
 };
 
-use crate::controller::request::Request;
+use crate::controller::{
+    errors::{RequestError, StateError},
+    request::Request,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -30,12 +31,12 @@ enum Command {
 }
 
 pub struct Elevator {
-    pub id: i8,
+    pub id: usize,
     tx: Sender<Command>,
 }
 
 impl Elevator {
-    pub fn new(id: i8) -> Elevator {
+    pub fn new(id: usize) -> Elevator {
         let (tx, rx) = mpsc::channel(100);
         Self::start(rx);
         Elevator { id, tx }
@@ -108,18 +109,20 @@ impl Elevator {
         self.tx.send(Command::Destroy).await.ok()
     }
 
-    pub async fn add_request(&self, request: Request) -> Result<(), Box<dyn Error>> {
-        match self.tx.send(Command::AddRequest(request)).await {
+    pub async fn add_request(&self, request: Request) -> Result<(), RequestError> {
+        match self.tx.send(Command::AddRequest(request.clone())).await {
             Ok(_) => Ok(()),
-            Err(_) => Err("error adding request".into()),
+            Err(_) => Err(RequestError { request }),
         }
     }
 
-    pub async fn get_state(&self) -> Result<ElevatorState, Box<dyn Error>> {
+    pub async fn get_state(&self) -> Result<ElevatorState, StateError> {
         let (tx, rx) = oneshot::channel();
         match self.tx.send(Command::GetStatus { reply: tx }).await {
             Ok(_) => Ok(rx.await.unwrap()),
-            Err(_) => Err("unable to get state".into()),
+            Err(_) => Err(StateError {
+                elevator_id: self.id,
+            }),
         }
     }
 }
