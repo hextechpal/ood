@@ -1,24 +1,22 @@
 mod elevator;
 pub mod errors;
 pub mod request;
+mod strategy;
 
-use std::{collections::HashMap, error::Error, sync::Mutex};
+use std::collections::HashMap;
 
 use elevator::Elevator;
 use futures::future::join_all;
+use tracing::info;
 
-use crate::controller::{elevator::ElevatorState, errors::RequestError, request::Request};
+use crate::controller::{
+    elevator::ElevatorState, errors::RequestError, request::Request, strategy::Strategy,
+};
 
-#[allow(dead_code)]
-enum Strategy {
-    Closest,
-}
-
-#[allow(dead_code)]
 pub struct Controller {
     elevators: Vec<Elevator>,
     strategy: Strategy,
-    mutex: Mutex<()>,
+    // mutex: Mutex<()>,
 }
 
 #[allow(dead_code)]
@@ -28,32 +26,31 @@ impl Controller {
         Controller {
             elevators,
             strategy: Strategy::Closest,
-            mutex: Mutex::new(()),
+            // mutex: Mutex::new(()),
         }
     }
 
     pub async fn request(&self, from: i16, to: i16) -> Result<bool, RequestError> {
-        let el = self.select_elevator(from, to).await;
-        el.add_request(Request::new(from, to)).await?;
-        Ok(true)
+        let request = Request::new(from, to);
+        // let _lock = self.mutex.lock().expect("should acquire lock");
+        match self.strategy.select_elevator(&self.elevators, from).await {
+            Some(id) => {
+                info!("elevator selected: {}", id);
+                let el = self.elevators.iter().find(|&e| e.id == id).unwrap();
+                el.add_request(request).await?;
+                Ok(true)
+            }
+
+            None => Err(RequestError { request }),
+        }
     }
 
-    // Lets explore streams here
     pub async fn state(&self) -> HashMap<usize, ElevatorState> {
-        let results: Vec<_> = join_all(
-            self.elevators
-                .iter()
-                .map(|el| async move { (el.id, el.get_state().await) }),
-        )
-        .await;
+        let results: Vec<_> = join_all(self.elevators.iter().map(|el| el.get_state())).await;
 
         results
             .into_iter()
-            .filter_map(|(id, res)| res.ok().map(|state| (id, state)))
+            .filter_map(|res| res.ok().map(|state| (state.id, state)))
             .collect()
-    }
-
-    async fn select_elevator(&self, _from: i16, _to: i16) -> &Elevator {
-        &self.elevators.first().unwrap()
     }
 }

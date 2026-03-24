@@ -5,6 +5,7 @@ use tokio::{
     },
     task::JoinHandle,
 };
+use tracing::{debug, info, warn};
 
 use crate::controller::{
     errors::{RequestError, StateError},
@@ -19,14 +20,18 @@ pub enum Direction {
 
 #[derive(Debug, Clone, Copy)]
 pub struct ElevatorState {
-    dir: Direction,
-    pos: i16,
-    is_idle: bool,
+    pub id: usize,
+    pub dir: Direction,
+    pub pos: i16,
+    pub is_idle: bool,
 }
 
 enum Command {
     AddRequest(Request),
-    GetStatus { reply: OneshotSender<ElevatorState> },
+    GetStatus {
+        reply: OneshotSender<ElevatorState>,
+    },
+    #[allow(dead_code)]
     Destroy,
 }
 
@@ -38,12 +43,13 @@ pub struct Elevator {
 impl Elevator {
     pub fn new(id: usize) -> Elevator {
         let (tx, rx) = mpsc::channel(100);
-        Self::start(rx);
+        Self::start(id, rx);
         Elevator { id, tx }
     }
 
-    fn start(mut rx: Receiver<Command>) -> JoinHandle<()> {
+    fn start(id: usize, mut rx: Receiver<Command>) -> JoinHandle<()> {
         let mut state = ElevatorState {
+            id,
             pos: 0,
             dir: Direction::Up,
             is_idle: true,
@@ -57,13 +63,13 @@ impl Elevator {
                         Command::AddRequest(request) => {
                             let start = state.pos;
                             let dest = request.to;
-                            println!("Request Picked: {:?}, State: {:?}", request, state);
+                            debug!("Request Picked: {:?}, State: {:?}", request, state);
                             if start < dest {
                                 state.is_idle = false;
                                 state.dir = Direction::Up;
                                 for floor in start + 1..=dest {
                                     state.pos = floor;
-                                    println!(
+                                    debug!(
                                         "Request Processing : {:?}, State: {:?}",
                                         request, state
                                     );
@@ -75,7 +81,7 @@ impl Elevator {
                                 state.dir = Direction::Down;
                                 for floor in (dest..start).rev() {
                                     state.pos = floor;
-                                    println!(
+                                    debug!(
                                         "Request Processing : {:?}, State: {:?}",
                                         request, state
                                     );
@@ -84,20 +90,20 @@ impl Elevator {
                                 }
                             }
                             state.is_idle = true;
-                            println!("Request Processed: {:?}, State: {:?}", request, state);
+                            info!("Request Processed: {:?}, State: {:?}", request, state);
                         }
                         Command::GetStatus { reply } => {
                             reply
                                 .send(state)
                                 .expect("state communication to be successful");
                         }
-                        Command::Destroy => {
-                            println!("received destroy: stopping");
+                        _ => {
+                            warn!("received destroy: stopping");
                             break;
                         }
                     },
                     None => {
-                        println!("worker: all senders dropped, exiting");
+                        warn!("worker: all senders dropped, exiting");
                         break;
                     }
                 }
@@ -105,7 +111,7 @@ impl Elevator {
         })
     }
 
-    pub async fn stop(self) -> Option<()> {
+    pub async fn _stop(self) -> Option<()> {
         self.tx.send(Command::Destroy).await.ok()
     }
 
