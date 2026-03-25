@@ -2,6 +2,8 @@
 name = "elevator"
 path = "src/elevator/main.rs"
 
+[lib]
+path = "src/cache/lib.rs"
 
 [package]
 name = "ood"
