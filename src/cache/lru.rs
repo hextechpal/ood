@@ -1,7 +1,6 @@
 use std::{
-    collections::{HashMap, btree_map::Keys},
+    collections::HashMap,
     hash::Hash,
-    io::Seek,
 };
 
 use crate::Cache;
