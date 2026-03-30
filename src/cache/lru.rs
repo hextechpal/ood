@@ -20,6 +20,7 @@ where
     tail: Option<usize>,
     nodes: Vec<Option<Node<K, V>>>,
     cache: HashMap<K, usize>,
+    free: Vec<usize>,
 }
 
 impl<K, V> LRUCache<K, V>
@@ -34,6 +35,7 @@ where
             tail: None,
             nodes: Vec::with_capacity(capacity),
             cache: HashMap::with_capacity(capacity),
+            free: Vec::new(),
         }
     }
 
@@ -102,6 +104,7 @@ where
         self.nodes[tail_idx] = None;
         self.cache.remove(&tail_key);
         self.size -= 1;
+        self.free.push(tail_idx);
     }
 
     fn insert_at_head(&mut self, key: K, value: V) {
@@ -111,8 +114,18 @@ where
             prev: self.head,
             next: None,
         };
-        self.nodes.push(Some(node));
-        let push_idx = self.nodes.len() - 1;
+
+        let push_idx = match self.free.pop() {
+            Some(free_idx) => {
+                self.nodes[free_idx] = Some(node);
+                free_idx
+            }
+            None => {
+                self.nodes.push(Some(node));
+                self.nodes.len() - 1
+            }
+        };
+
         self.attach_at_head(push_idx);
         self.cache.insert(key, push_idx);
         self.size += 1;
@@ -207,6 +220,8 @@ mod test {
 
         assert_eq!(head_key(&cache), Some(3));
         assert_eq!(tail_key(&cache), Some(2));
+        // We reuse the slot of the nodes rather than keeping it empty
+        assert_eq!(cache.nodes.len(), 2);
         assert!(!cache.cache.contains_key(&1));
         assert_eq!(cache.node(*cache.cache.get(&2).unwrap()).value, "two");
         assert_eq!(cache.node(*cache.cache.get(&3).unwrap()).value, "three");
@@ -229,8 +244,8 @@ mod test {
 
         assert_eq!(head_key(&cache), Some(3));
         assert_eq!(tail_key(&cache), Some(1));
-        // the nodes values is set to None representing a hole but the memory is not freed
-        assert_eq!(cache.nodes.len(), 3);
+        // we reuse the same slot of the vector
+        assert_eq!(cache.nodes.len(), 2);
         assert!(cache.cache.contains_key(&1));
         assert!(!cache.cache.contains_key(&2));
         assert_eq!(cache.node(*cache.cache.get(&3).unwrap()).value, "three");
