@@ -229,6 +229,8 @@ mod test {
 
         assert_eq!(head_key(&cache), Some(3));
         assert_eq!(tail_key(&cache), Some(1));
+        // the nodes values is set to None representing a hole but the memory is not freed
+        assert_eq!(cache.nodes.len(), 3);
         assert!(cache.cache.contains_key(&1));
         assert!(!cache.cache.contains_key(&2));
         assert_eq!(cache.node(*cache.cache.get(&3).unwrap()).value, "three");
