@@ -1,7 +1,10 @@
 mod lru;
 
-pub trait Cache<K, V> {
-    fn put(&mut self, key: K, value: V);
+pub trait Cache<K, V>
+where
+    V: Clone,
+{
+    fn put(&self, key: K, value: V);
 
-    fn get(&mut self, key: &K) -> Option<&V>;
+    fn get(&self, key: &K) -> Option<V>;
 }
