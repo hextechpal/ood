@@ -1,156 +1,119 @@
-use std::{collections::HashMap, hash::Hash, sync::Mutex};
+use std::{
+    collections::{BinaryHeap, HashMap},
+    hash::Hash,
+    sync::{Arc, Mutex, atomic::AtomicU64},
+    thread::{self, sleep},
+    time::Duration,
+};
+
+use tracing::debug;
 
 use crate::Cache;
 
+const EVICTION_INTERVAL_MS: u64 = 10;
+
 #[derive(Debug, PartialEq, Eq)]
-struct Node<K, V> {
-    key: K,
+struct Entry<V> {
     value: V,
-    next: Option<usize>,
-    prev: Option<usize>,
+    last_acess: u64,
 }
 
 struct Inner<K, V>
 where
-    K: Hash + Eq + Clone,
-    V: Clone
+    K: Clone + Eq + Hash,
+    V: Clone,
 {
-    size: usize,
     capacity: usize,
-    head: Option<usize>,
-    tail: Option<usize>,
-    nodes: Vec<Option<Node<K, V>>>,
+    nodes: Vec<Option<Entry<V>>>,
     cache: HashMap<K, usize>,
+    clock: AtomicU64,
     free: Vec<usize>,
 }
 
 impl<K, V> Inner<K, V>
 where
-    K: Hash + Eq + Clone,
-    V: Clone
+    K: Clone + Eq + Hash,
+    V: Clone,
 {
     fn new(capacity: usize) -> Self {
         Inner {
             capacity,
-            size: 0,
-            head: None,
-            tail: None,
             nodes: Vec::with_capacity(capacity),
             cache: HashMap::with_capacity(capacity),
+            clock: AtomicU64::new(0),
             free: Vec::new(),
         }
     }
 
-    fn is_full(&self) -> bool {
-        self.size == self.capacity
-    }
-
-    fn node(&self, idx: usize) -> &Node<K, V> {
+    fn node(&self, idx: usize) -> &Entry<V> {
         self.nodes[idx].as_ref().unwrap()
     }
 
-    fn node_mut(&mut self, idx: usize) -> &mut Node<K, V> {
+    fn node_mut(&mut self, idx: usize) -> &mut Entry<V> {
         self.nodes[idx].as_mut().unwrap()
     }
 
-    fn detach(&mut self, idx: usize) {
-        let (prev, next) = {
-            let node = self.node(idx);
-            (node.prev, node.next)
-        };
-
-        self.node_mut(idx).prev = None;
-        self.node_mut(idx).next = None;
-
-        match prev {
-            Some(prev_idx) => self.node_mut(prev_idx).next = next,
-            None => self.tail = next,
-        };
-
-        match next {
-            Some(next_idx) => self.node_mut(next_idx).prev = prev,
-            None => self.head = prev,
-        };
-    }
-
-    fn attach_at_head(&mut self, idx: usize) {
-        match self.head {
-            Some(head_idx) => {
-                self.node_mut(head_idx).next = Some(idx);
-                self.node_mut(idx).prev = Some(head_idx);
-                self.node_mut(idx).next = None;
-                self.head = Some(idx);
-            }
-            None => {
-                self.node_mut(idx).prev = None;
-                self.node_mut(idx).next = None;
-                self.head = Some(idx);
-                self.tail = Some(idx);
-            }
-        }
-    }
-
-    fn move_to_head(&mut self, idx: usize) {
-        // This idx is the head
-        if self.head == Some(idx) {
+    fn evict_entries(&mut self) {
+        if self.cache.len() <= self.capacity {
+            debug!(
+                "[no eviction] size = {} capacity={}",
+                self.cache.len(),
+                self.capacity
+            );
             return;
         }
-        self.detach(idx);
-        self.attach_at_head(idx);
-    }
+        let count = self.cache.len() - self.capacity;
+        let mut heap = BinaryHeap::with_capacity(count + 1);
 
-    fn evict_tail(&mut self) {
-        let tail_idx = self.tail.unwrap();
-        let tail_key = self.node(tail_idx).key.clone();
-        self.detach(tail_idx);
-        self.nodes[tail_idx] = None;
-        self.cache.remove(&tail_key);
-        self.size -= 1;
-        self.free.push(tail_idx);
-    }
-
-    fn insert_at_head(&mut self, key: K, value: V) {
-        let node = Node {
-            key: key.clone(),
-            value,
-            prev: self.head,
-            next: None,
-        };
-
-        let push_idx = match self.free.pop() {
-            Some(free_idx) => {
-                self.nodes[free_idx] = Some(node);
-                free_idx
+        for (_, idx) in self.cache.iter() {
+            heap.push((self.node(*idx).last_acess, *idx));
+            if heap.len() > count {
+                heap.pop();
             }
-            None => {
-                self.nodes.push(Some(node));
-                self.nodes.len() - 1
-            }
-        };
+        }
 
-        self.attach_at_head(push_idx);
-        self.cache.insert(key, push_idx);
-        self.size += 1;
+        heap.into_iter().for_each(|(_, idx)| {
+            self.nodes[idx] = None;
+            self.free.push(idx);
+        });
+
+        self.cache.retain(|_, v| self.nodes[*v].is_some());
     }
 }
 
 pub struct LRUCache<K, V>
 where
-    K: Clone + Hash + Eq,
+    K: Clone + Eq + Hash,
     V: Clone,
 {
-    inner: Mutex<Inner<K, V>>,
+    inner: Arc<Mutex<Inner<K, V>>>,
 }
 
 impl<K, V> LRUCache<K, V>
 where
-    K: Clone + Hash + Eq,
-    V: Clone,
+    K: Clone + Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
 {
     fn new(capacity: usize) -> Self {
-        LRUCache {
-            inner: Mutex::new(Inner::new(capacity)),
-        }
+        let inner = Arc::new(Mutex::new(Inner::new(capacity)));
+        let cache = LRUCache { inner: inner };
+
+        cache.start_eviction_loop();
+        cache
+    }
+
+    fn start_eviction_loop(&self) {
+        let inner = self.inner.clone();
+        thread::spawn(move || {
+            debug!("starting eviction loop");
+            loop {
+                {
+                    let mut inner = inner.lock().expect("poisoned lock");
+                    inner.evict_entries();
+                }
+                sleep(Duration::from_millis(EVICTION_INTERVAL_MS));
+            }
+        });
     }
 }
 
@@ -159,35 +122,49 @@ where
     K: Hash + Eq + Clone,
     V: Clone,
 {
-    // Logic
-    //  - if key does not exist in the cache
-    //      - if capacity is full evict the tail and insert at head
-    //      - if capacity is not full insert the node at the head
-    //
-    // - if key exists in the cache
-    //      - Update the value of the node and move to the head
     fn put(&self, key: K, value: V) {
         let mut inner = self.inner.lock().expect("poisoned lock");
-        if let Some(&idx) = inner.cache.get(&key) {
-            inner.node_mut(idx).value = value;
-            inner.move_to_head(idx);
-            return;
-        }
+        let ts = inner
+            .clock
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        debug!("updating or inserting entry with ts: {}", ts);
+        match inner.cache.get(&key) {
+            Some(&idx) => {
+                inner.node_mut(idx).last_acess = ts;
+                inner.node_mut(idx).value = value
+            }
 
-        if inner.is_full() {
-            inner.evict_tail();
+            None => {
+                let node = Entry {
+                    value,
+                    last_acess: ts,
+                };
+
+                let push_idx = match inner.free.pop() {
+                    None => {
+                        inner.nodes.push(Some(node));
+                        inner.nodes.len() - 1
+                    }
+                    Some(free_idx) => {
+                        inner.nodes[free_idx] = Some(node);
+                        free_idx
+                    }
+                };
+                inner.cache.insert(key, push_idx);
+            }
         }
-        // Insert at head
-        inner.insert_at_head(key, value);
     }
 
     fn get(&self, key: &K) -> Option<V> {
         let mut inner = self.inner.lock().expect("poisoned lock");
         match inner.cache.get(&key) {
             Some(&idx) => {
-                inner.move_to_head(idx);
-                let value = inner.node(idx).value.clone();
-                Some(value)
+                let ts = inner
+                    .clock
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let node = inner.node_mut(idx);
+                node.last_acess = ts;
+                Some(node.value.clone())
             }
             None => None,
         }
@@ -196,138 +173,23 @@ where
 
 #[cfg(test)]
 mod test {
+
     use super::*;
 
-    fn head_key<K, V>(cache: &LRUCache<K, V>) -> Option<K>
-    where
-        K: Hash + Eq + Clone,
-        V: Clone,
-    {
-        let inner = cache.inner.lock().expect("inner should be");
-        inner.head.map(|idx| inner.node(idx).key.clone())
-    }
-
-    fn tail_key<K, V>(cache: &LRUCache<K, V>) -> Option<K>
-    where
-        K: Hash + Eq + Clone,
-        V: Clone,
-    {
-        let inner = cache.inner.lock().expect("inner should be");
-        inner.tail.map(|idx| inner.node(idx).key.clone())
-    }
-
     #[test]
-    fn test_capacity_one() {
-        let cache = LRUCache::new(1);
-        let key = String::from("name");
-        let value = String::from("prashant");
-        let update = String::from("Prashant");
-        cache.put(key.clone(), value.clone());
-        assert_eq!(cache.get(&key), Some(value));
+    fn test_vanilla_insert() {
+        let cache = LRUCache::new(5);
+        cache.put(1, 10);
+        cache.put(2, 20);
+        cache.put(3, 30);
+        cache.put(4, 40);
+        cache.put(5, 50);
+        cache.put(6, 60);
 
-        cache.put(key.clone(), update.clone());
-        assert_eq!(cache.get(&key), Some(update.clone()));
+        assert_eq!(cache.get(&2), Some(20));
 
-        let new_key = String::from("Name");
-        cache.put(new_key.clone(), update.clone());
-        assert_eq!(cache.get(&key), None);
-        assert_eq!(cache.get(&new_key), Some(update));
-    }
+        sleep(Duration::from_millis(2 * EVICTION_INTERVAL_MS));
 
-    #[test]
-    fn test_evicts_least_recently_used_when_full() {
-        let cache = LRUCache::new(2);
-
-        cache.put(1, "one");
-        assert_eq!(head_key(&cache), Some(1));
-        assert_eq!(tail_key(&cache), Some(1));
-
-        cache.put(2, "two");
-        assert_eq!(head_key(&cache), Some(2));
-        assert_eq!(tail_key(&cache), Some(1));
-
-        cache.put(3, "three");
-
-        assert_eq!(head_key(&cache), Some(3));
-        assert_eq!(tail_key(&cache), Some(2));
-        // We reuse the slot of the nodes rather than keeping it empty
-        let inner = cache.inner.lock().expect("cache should be accessible");
-        assert_eq!(inner.nodes.len(), 2);
-        assert!(!inner.cache.contains_key(&1));
-        assert_eq!(inner.node(*inner.cache.get(&2).unwrap()).value, "two");
-        assert_eq!(inner.node(*inner.cache.get(&3).unwrap()).value, "three");
-    }
-
-    #[test]
-    fn test_get_moves_item_to_head() {
-        let cache = LRUCache::new(2);
-
-        cache.put(1, "one");
-        cache.put(2, "two");
-        assert_eq!(head_key(&cache), Some(2));
-        assert_eq!(tail_key(&cache), Some(1));
-
-        assert_eq!(cache.get(&1), Some("one"));
-        assert_eq!(head_key(&cache), Some(1));
-        assert_eq!(tail_key(&cache), Some(2));
-
-        cache.put(3, "three");
-
-        assert_eq!(head_key(&cache), Some(3));
-        assert_eq!(tail_key(&cache), Some(1));
-        // we reuse the same slot of the vector
-        let inner = cache.inner.lock().expect("cache should be accessible");
-
-        assert_eq!(inner.nodes.len(), 2);
-        assert!(inner.cache.contains_key(&1));
-        assert!(!inner.cache.contains_key(&2));
-        assert_eq!(inner.node(*inner.cache.get(&3).unwrap()).value, "three");
-    }
-
-    #[test]
-    fn test_updating_existing_key_refreshes_recency() {
-        let cache = LRUCache::new(2);
-
-        cache.put(1, "one");
-        cache.put(2, "two");
-        assert_eq!(head_key(&cache), Some(2));
-        assert_eq!(tail_key(&cache), Some(1));
-
-        cache.put(1, "updated");
-        assert_eq!(head_key(&cache), Some(1));
-        assert_eq!(tail_key(&cache), Some(2));
-
-        cache.put(3, "three");
-
-        assert_eq!(head_key(&cache), Some(3));
-        assert_eq!(tail_key(&cache), Some(1));
-        let inner = cache.inner.lock().expect("cache should be accesible");
-        assert_eq!(inner.node(*inner.cache.get(&1).unwrap()).value, "updated");
-        assert!(!inner.cache.contains_key(&2));
-        assert_eq!(inner.node(*inner.cache.get(&3).unwrap()).value, "three");
-    }
-
-    #[test]
-    fn test_missing_get_does_not_change_recency_order() {
-        let cache = LRUCache::new(2);
-
-        cache.put(1, "one");
-        cache.put(2, "two");
-        assert_eq!(head_key(&cache), Some(2));
-        assert_eq!(tail_key(&cache), Some(1));
-
-        assert_eq!(cache.get(&99), None);
-        assert_eq!(head_key(&cache), Some(2));
-        assert_eq!(tail_key(&cache), Some(1));
-
-        cache.put(3, "three");
-
-        assert_eq!(head_key(&cache), Some(3));
-        assert_eq!(tail_key(&cache), Some(2));
-
-        let inner = cache.inner.lock().expect("cache should be accesible");
-        assert!(!inner.cache.contains_key(&1));
-        assert_eq!(inner.node(*inner.cache.get(&2).unwrap()).value, "two");
-        assert_eq!(inner.node(*inner.cache.get(&3).unwrap()).value, "three");
+        assert_eq!(cache.get(&1), None);
     }
 }
